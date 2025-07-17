@@ -5,11 +5,13 @@ import (
 	"net/http"
 	"time"
 
-	"miniproject/models"
+	"fmt"                // Import fmt for error messages
+	"miniproject/models" // Ensure this import path is correct based on your module
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options" // Import options for FindOne
 )
 
 var appCollection *mongo.Collection
@@ -21,21 +23,49 @@ func InitAppCollection(db *mongo.Database) {
 func SubmitApplication(c *gin.Context) {
 	name := c.PostForm("name")
 	role := c.PostForm("role")
-	file, _ := c.FormFile("resume")
 
-	uploadPath := "./backend/uploads/" + file.Filename
-	c.SaveUploadedFile(file, uploadPath)
+	// Validate required fields
+	if name == "" || role == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Name and Role are required fields."})
+		return
+	}
+
+	file, err := c.FormFile("resume")
+	var resumePath string
+	if err != nil {
+		// If resume is optional, handle the error gracefully.
+		// If resume is mandatory, return an error.
+		if err == http.ErrMissingFile {
+			// Resume file is missing, but maybe it's optional.
+			// For now, we'll allow it to be missing, but you can change this.
+			fmt.Println("Resume file not provided (optional).")
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to get resume file: %v", err)})
+			return
+		}
+	} else {
+		uploadPath := "./backend/uploads/" + file.Filename
+		if err := c.SaveUploadedFile(file, uploadPath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to save resume file: %v", err)})
+			return
+		}
+		resumePath = "/uploads/" + file.Filename
+	}
 
 	app := models.Application{
 		Name:       name,
 		Role:       role,
-		ResumePath: "/uploads/" + file.Filename,
+		ResumePath: resumePath, // Use the determined resumePath
 		CreatedAt:  time.Now(),
 	}
 
-	_, err := appCollection.InsertOne(context.TODO(), app)
+	// Use a context with timeout for database operations
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = appCollection.InsertOne(ctx, app)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save application"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to save application: %v", err)})
 		return
 	}
 
@@ -43,15 +73,20 @@ func SubmitApplication(c *gin.Context) {
 }
 
 func ListApplications(c *gin.Context) {
-	cursor, err := appCollection.Find(context.TODO(), bson.M{})
+	// Use a context with timeout for database operations
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cursor, err := appCollection.Find(ctx, bson.M{})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve applications"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to retrieve applications: %v", err)})
 		return
 	}
+	defer cursor.Close(ctx) // Important: Close the cursor to release resources
 
 	var apps []models.Application
-	if err := cursor.All(context.TODO(), &apps); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode applications"})
+	if err := cursor.All(ctx, &apps); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to decode applications: %v", err)})
 		return
 	}
 
@@ -60,10 +95,23 @@ func ListApplications(c *gin.Context) {
 
 func GetApplicationByName(c *gin.Context) {
 	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Application name is required."})
+		return
+	}
+
+	// Use a context with timeout for database operations
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	var app models.Application
-	err := appCollection.FindOne(context.TODO(), bson.M{"name": name}).Decode(&app)
+	err := appCollection.FindOne(ctx, bson.M{"name": name}, options.FindOne()).Decode(&app) // Added options for consistency
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Application not found"})
+		if err == mongo.ErrNoDocuments {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Application with name '%s' not found.", name)})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to retrieve application: %v", err)})
+		}
 		return
 	}
 
